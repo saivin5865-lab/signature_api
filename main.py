@@ -1,49 +1,61 @@
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse
+from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input
+from tensorflow.keras.preprocessing import image
+from tensorflow.keras.models import Model
+from sklearn.metrics.pairwise import cosine_similarity
 from PIL import Image
 import numpy as np
 import io, json, joblib, os
 
 app = FastAPI()
 
-# --- Load models ---
-MODEL_PATH = "models/signature_verification_model.pkl"
-ENCODER_PATH = "models/label_encoder.pkl"
-JSON_PATH = "data/reference_data.json"
+# Load your trained model and label encoder
+clf = joblib.load("models/signature_verification_model.pkl")
+label_encoder = joblib.load("models/label_encoder.pkl")
 
-model = joblib.load(MODEL_PATH)
-encoder = joblib.load(ENCODER_PATH)
-
-# --- Load JSON reference ---
-with open(JSON_PATH, "r") as f:
+# Load reference data (JSON)
+with open("data/reference_data.json", "r") as f:
     reference_data = json.load(f)
 
-@app.post("/compare")
-async def compare_signature(name: str = Form(...), file: UploadFile = None):
-    if name not in reference_data:
-        return JSONResponse({"error": "Name not found in reference data"}, status_code=404)
+# Feature extractor (MobileNetV2)
+base_model = MobileNetV2(weights='imagenet', include_top=False, pooling='avg')
+feature_model = Model(inputs=base_model.input, outputs=base_model.output)
 
+def extract_features(img_bytes):
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB").resize((224, 224))
+    x = np.array(img)
+    x = np.expand_dims(x, axis=0)
+    x = preprocess_input(x)
+    return feature_model.predict(x).flatten()
+
+@app.get("/")
+def root():
+    return {"message": "Signature comparison API is running!"}
+
+@app.post("/compare")
+async def compare_signature(name: str = Form(...), file: UploadFile = File(...)):
+    if name not in reference_data:
+        return JSONResponse({"error": f"No reference found for {name}"}, status_code=404)
+    
+    # Load reference image
     ref_path = reference_data[name]
     if not os.path.exists(ref_path):
-        return JSONResponse({"error": f"Reference image {ref_path} not found"}, status_code=404)
+        return JSONResponse({"error": f"Reference image not found: {ref_path}"}, status_code=404)
+    
+    with open(ref_path, "rb") as f:
+        ref_bytes = f.read()
 
-    # Load reference image
-    ref_img = Image.open(ref_path).convert("L").resize((224, 224))
-    ref_arr = np.array(ref_img).flatten().reshape(1, -1)
+    # Extract features
+    ref_feat = extract_features(ref_bytes)
+    new_feat = extract_features(await file.read())
 
-    # Load uploaded signature
-    upload_img = Image.open(io.BytesIO(await file.read())).convert("L").resize((224, 224))
-    upload_arr = np.array(upload_img).flatten().reshape(1, -1)
-
-    # Compare using model (dummy example: similarity check)
-    ref_pred = model.predict(ref_arr)
-    upload_pred = model.predict(upload_arr)
-
-    similarity = float(np.dot(ref_pred, upload_pred.T))
-    result = similarity > 0.9  # adjust threshold
+    # Compare using cosine similarity
+    sim = cosine_similarity([ref_feat], [new_feat])[0][0]
+    match = bool(sim >= 0.85)
 
     return JSONResponse({
-        "match": bool(result),
-        "similarity": similarity,
-        "name": name
+        "name": name,
+        "similarity": float(sim),
+        "match": match
     })

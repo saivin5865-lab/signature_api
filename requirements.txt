@@ -1,4 +1,6 @@
 fastapi
 uvicorn
+tensorflow
+scikit-learn
+pillow
 numpy
-opencv-python-headless
